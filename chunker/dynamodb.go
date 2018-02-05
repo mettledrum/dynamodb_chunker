@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// pre-reqs
+// prerequisites
 // table of "ItemMap" with PK of "ID" of type Number
 // table of "ItemChunks" with PK of "ID" of type String
 
@@ -177,13 +177,13 @@ func Upsert(id int64, x interface{}, svc *dynamodb.DynamoDB) error {
 		},
 		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
 			":ut": &dynamodb.AttributeValue{
-				N: aws.String(m.UpdateTime.Format(time.RFC3339)), // default marshal value
+				S: aws.String(m.UpdateTime.Format(time.RFC3339)), // default marshal value
 			},
 			":cc": &dynamodb.AttributeValue{
 				N: aws.String(strconv.Itoa(m.ChunkCount)),
 			},
 			":uuid": &dynamodb.AttributeValue{
-				N: aws.String(m.UUID),
+				S: aws.String(m.UUID),
 			},
 		},
 		Item: map[string]*dynamodb.AttributeValue{
