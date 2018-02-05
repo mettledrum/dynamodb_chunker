@@ -1,6 +1,16 @@
 package main
 
+import (
+	"fmt"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/dynamodb_chunker/chunker"
+)
+
 func main() {
+	svc := dynamodb.New(session.New(), aws.NewConfig().WithRegion("us-east-2"))
 
 	type thing struct {
 		ID       int64  `json:"id"`
@@ -12,6 +22,9 @@ func main() {
 		Contents: "what's up doc?",
 	}
 
-	chunker.Upsert(t.ID, t)
+	err := chunker.Upsert(t.ID, t, svc)
+	fmt.Println(err)
 
+	b, err := chunker.Get(t.ID, svc)
+	fmt.Println(b, err)
 }
