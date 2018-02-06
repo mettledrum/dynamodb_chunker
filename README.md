@@ -11,6 +11,8 @@ If there are concurrent `Upsert` calls racing one another, only the call made mo
 
 ## TODO
 - get rid of panic(err) junk
+- handle 400: `ConditionalCheckFailedException: The conditional request failed`
+- increase granularity of ItemMap.UpdateTime beyond seconds
 - test with a lot of concurrency
 - make a script to create table with prerequisites
 - interfaces
