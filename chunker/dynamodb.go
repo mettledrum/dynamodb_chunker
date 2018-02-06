@@ -1,8 +1,10 @@
 package chunker
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -10,10 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/google/uuid"
 )
-
-// prerequisites
-// table of "ItemMap" with PK of "ID" of type Number
-// table of "ItemChunks" with PK of "ID" of type String
 
 func toItemAndChunks(id int64, x interface{}) itemMap {
 	b, err := json.Marshal(&x)
@@ -53,8 +51,9 @@ func getChunks(b []byte, cv string, id int64) []itemChunk {
 		}
 
 		c := itemChunk{
-			ID:   getChunkID(id, cv, chunkCount),
-			Body: b[i:end],
+			ID:       getChunkID(id, cv, chunkCount),
+			ChunkIdx: chunkCount,
+			Body:     b[i:end],
 		}
 
 		chunks = append(chunks, c)
@@ -71,16 +70,40 @@ type itemMap struct {
 	UUID       string      // prevents case where UpdateTime is same for requests
 }
 
-// TODO: bytes or string length?
-const maxItemLen = 100 // 400kbps in DynamoDB
+// itemChunk.Body is broken into []byte batches based on this val
+// this happens before the base64 encoding for *AttributeValue.B
+const maxItemLen = 5 // 400kbs in DynamoDB
 
 type itemChunk struct {
-	ID   string // "ID•UUID•ChunkIdx" (PK)
-	Body []byte // contents of the resource split among chunks
+	ID       string // "ID•UUID•ChunkIdx" (PK)
+	ChunkIdx int    // starts at 1
+	Body     []byte // contents of the resource split among chunks
+}
+
+// custom logic to sort the responses from ItemChunk
+type byChunkNumber []map[string]*dynamodb.AttributeValue
+
+func (c byChunkNumber) Len() int {
+	return len(c)
+}
+func (c byChunkNumber) Swap(i, j int) {
+	c[i], c[j] = c[j], c[i]
+}
+func (c byChunkNumber) Less(i, j int) bool {
+	ii, err := strconv.Atoi(*c[i]["ChunkIdx"].N)
+	if err != nil {
+		panic(err)
+	}
+	jj, err := strconv.Atoi(*c[j]["ChunkIdx"].N)
+	if err != nil {
+		panic(err)
+	}
+
+	return ii < jj
 }
 
 // Get retrieves the item and its concatenated chunks stored in DynamoDB
-func Get(id int64, svc *dynamodb.DynamoDB) ([]byte, error) {
+func Get(id int64, svc *dynamodb.DynamoDB, structPtr interface{}) error {
 	// get ItemMap to get ItemChunk IDs
 	getParams := &dynamodb.GetItemInput{
 		ConsistentRead: aws.Bool(true),
@@ -97,15 +120,15 @@ func Get(id int64, svc *dynamodb.DynamoDB) ([]byte, error) {
 	}
 	fmt.Printf("get ItemMap response: %v\n", getRes)
 
-	uuid := getRes.Item["UUID"].String()
-	chunkCountString := getRes.Item["ChunkCount"].String()
-	chunkCount, err := strconv.Atoi(chunkCountString)
+	uuid := *getRes.Item["UUID"].S
+	n := *getRes.Item["ChunkCount"].N
+	chunkCount, err := strconv.Atoi(n)
 	if err != nil {
 		panic(err)
 	}
 
 	chunkKeys := []map[string]*dynamodb.AttributeValue{}
-	for i := 0; i < chunkCount; i++ {
+	for i := 1; i <= chunkCount; i++ {
 		chunkID := getChunkID(id, uuid, i)
 		k := map[string]*dynamodb.AttributeValue{
 			"ID": {
@@ -122,14 +145,25 @@ func Get(id int64, svc *dynamodb.DynamoDB) ([]byte, error) {
 			},
 		},
 	}
-
+	fmt.Printf("get ItemChunks request: %v\n", getChunkParams)
 	getChunkRes, err := svc.BatchGetItem(getChunkParams)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("get ItemChunks response: %v\n", getChunkRes)
 
-	return json.Marshal(getChunkRes)
+	sort.Sort(byChunkNumber(getChunkRes.Responses["ItemChunks"]))
+
+	combined := []byte{}
+	w := bytes.NewBuffer(combined)
+	for _, c := range getChunkRes.Responses["ItemChunks"] {
+		_, err := w.Write(c["Body"].B)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	return json.Unmarshal(w.Bytes(), structPtr)
 }
 
 // Upsert creates or updates a resource in multiple tables and items in DynamoDB
@@ -150,6 +184,9 @@ func Upsert(id int64, x interface{}, svc *dynamodb.DynamoDB) error {
 					"Body": {
 						B: c.Body, // automatically base64 encoded
 					},
+					"ChunkIdx": &dynamodb.AttributeValue{
+						N: aws.String(strconv.Itoa(c.ChunkIdx)),
+					},
 				},
 			},
 		}
@@ -160,44 +197,48 @@ func Upsert(id int64, x interface{}, svc *dynamodb.DynamoDB) error {
 			"ItemChunks": ws,
 		},
 	}
+	fmt.Printf("batch chunk write request: %v\n", batchParams)
+
 	batchRes, err := svc.BatchWriteItem(batchParams)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("response from batch chunk write: %v\n", batchRes)
+	fmt.Printf("batch chunk write response: %v\n", batchRes)
 
 	// (2)
 	putParams := &dynamodb.PutItemInput{
 		TableName:           aws.String("ItemMap"),
-		ConditionExpression: aws.String("SET #ut = :ut, #cc = :cc, #uuid = :uuid IF #ut < :ut"),
+		ConditionExpression: aws.String("#ut <= :ut or attribute_not_exists(#ut)"),
 		ExpressionAttributeNames: map[string]*string{
-			"#ut":   aws.String("UpdateTime"),
-			"#cc":   aws.String("ChunkCount"),
-			"#uuid": aws.String("UUID"),
+			"#ut": aws.String("UpdateTime"),
 		},
 		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
 			":ut": &dynamodb.AttributeValue{
 				S: aws.String(m.UpdateTime.Format(time.RFC3339)), // default marshal value
-			},
-			":cc": &dynamodb.AttributeValue{
-				N: aws.String(strconv.Itoa(m.ChunkCount)),
-			},
-			":uuid": &dynamodb.AttributeValue{
-				S: aws.String(m.UUID),
 			},
 		},
 		Item: map[string]*dynamodb.AttributeValue{
 			"ID": {
 				N: aws.String(strconv.FormatInt(m.ID, 10)),
 			},
+			"ChunkCount": &dynamodb.AttributeValue{
+				N: aws.String(strconv.Itoa(m.ChunkCount)),
+			},
+			"UUID": &dynamodb.AttributeValue{
+				S: aws.String(m.UUID),
+			},
+			"UpdateTime": &dynamodb.AttributeValue{
+				S: aws.String(m.UpdateTime.Format(time.RFC3339)),
+			},
 		},
 	}
+	fmt.Printf("itemMap put request: %v\n", putParams)
 
 	putRes, err := svc.PutItem(putParams)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("response from item put: %v\n", putRes)
+	fmt.Printf("itemMap put response: %v\n", putRes)
 
 	return nil
 }
