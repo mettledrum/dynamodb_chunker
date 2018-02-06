@@ -8,3 +8,11 @@ If there are concurrent `Upsert` calls racing one another, only the call made mo
 ## Prerequisites
 - table of "ItemMap" with PK of "ID" of type Number
 - table of "ItemChunks" with PK of "ID" of type String
+
+## TODO
+- get rid of panic(err) junk
+- test with a lot of concurrency
+- make a script to create table with prerequisites
+- interfaces
+- add clean up script that kills orphaned ItemChunks that could be run in the background
+- configurable max chunk size
